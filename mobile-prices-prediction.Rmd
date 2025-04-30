@@ -1,0 +1,217 @@
+---
+title: "mobile-prices-prediction"
+author: "Henry Xia"
+date: "2025-04-30"
+output:
+  word_document: default
+  html_document: default
+---
+1)Executive summary
+The original data set is sourced from the website source: https://www.kaggle.com/datasets/vinothkannaece/mobiles-and-laptop-sales-data, which is a zip format.
+
+The original dataste has been unzipped, transformed as a rda file, and included at a github repository, https://github.com/Henryisagoodguy/mobile-price-prediction/blob/main/dat_raw.rda
+
+Please download the file to current working directory as a file named dat_raw.
+
+This is a data set for laptop and mobile sales with 50000 rows and 16 columns, I use some portion of this data set to train several algorithms to predict mobile price with features of brand, RAM and ROM, and select the best algorithm base on rmse score.
+
+Install required packages and load the dataset:
+
+```{r}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(gam)) install.packages("gam", repos = "http://cran.us.r-project.org")
+if(!require(rpart)) install.packages("rpart", repos = "http://cran.us.r-project.org")
+if(!require(randomForest)) install.packages("randomForest", repos = "http://cran.us.r-project.org")
+
+
+library(tidyverse)
+library(caret)
+library(gam)
+library(rpart)
+library(randomForest)
+
+load("dat_raw.rda")
+dim(dat_raw)
+head(dat_raw)
+```
+
+```{r, set up RMSE function}
+RMSE <- function(true_price, predicted_price){
+  sqrt(mean((true_price - predicted_price)^2))
+}
+```
+
+2) methods/analysis
+
+Preprocessing: clean data to remove unuseful data, keep data for mobile and features of Brand, RAM, and ROM.
+
+```{r}
+dat <- dat_raw %>% filter(Product == "Mobile Phone") %>% select(Brand, Price, RAM, ROM)
+head(dat)
+dim(dat)
+```
+
+Generate data sets for training and test
+
+```{r}
+set.seed(1)
+test_index <- createDataPartition(dat$Price, times = 1, p = 0.2, list = FALSE)
+temp <- dat[test_index, ]
+train_set <- dat[-test_index, ]
+test_set <- temp %>% semi_join(train_set, by = "Brand") %>% semi_join(train_set, by ="RAM") %>% semi_join(train_set, by = "ROM")
+
+removed <- anti_join(temp, test_set)
+train_set <- rbind(train_set, removed)
+```
+
+2.1) Use group average price as prediction. I calculate average price for each group of combinations of Brand, ROM and RAM at train set, and use the average prices as predicted price for each groups in test set.
+
+```{r}
+mu <- train_set %>% group_by(Brand, RAM, ROM) %>% summarize(mu = mean(Price))
+
+predicted_price_mu <- test_set %>% left_join(mu, by=c("Brand", "RAM", "ROM")) %>% pull(mu)
+
+mu_rmse <- RMSE(test_set$Price, predicted_price_mu)
+
+mu_rmse
+
+mean(test_set$Price)
+```
+
+mu_rmse is 57618.94, the average price of test_set is 102488.3.
+
+2.2) Use KNN model to predict price.
+
+```{r}
+train_knn <- train(Price ~ ., method = "knn", data = train_set)
+
+predicted_price_knn <- predict(train_knn, test_set, type = "raw")
+
+knn_rmse <- RMSE(test_set$Price, predicted_price_knn)
+
+knn_rmse 
+```
+
+knn_rmse is 57618.94, sames as mu_rmse.
+
+2.3) fine tune KNN model, I have tested several span of data frame to select the best K value, it turned out the best K value shall fall at somewhere between 50 and 70:
+
+```{r}
+data.frame(k = seq(50, 70, 5))
+
+train_knn_tunegrid <- train(Price ~ ., method = "knn", data = train_set, tuneGrid = data.frame(k = seq(50, 70, 5)))
+
+predicted_price_knntunegird <- predict(train_knn_tunegrid, test_set, type = "raw")
+
+knntunegrid_rmse <- RMSE(test_set$Price, predicted_price_knntunegird)
+
+knntunegrid_rmse
+
+train_knn_tunegrid$bestTune
+
+train_knn_tunegrid$finalModel
+```
+After tuning grid, the knntunegrid_rmse is 56782.4 less than 57618.94, the best K value is 65.
+
+2.4) Adjust cross validation parameters to speed up computation.
+
+```{r}
+control <- trainControl(method = "cv", number = 10, p = .9)
+
+train_knn_cv <- train(Price ~ ., method = "knn", data = train_set, tuneGrid = data.frame(k = seq(50, 80, 10)), trControl = control)
+
+predicted_price_cv <- predict(train_knn_cv, test_set, type = "raw")
+
+knncv_rmse <- RMSE(test_set$Price, predicted_price_cv)
+
+knncv_rmse
+```
+
+This knnCV rmse score is same as the rmse of knn tunegrid model, but it took significant less time to run.
+
+2.5) Use Loess model to predict price
+
+```{r}
+library(gam)
+grid <- expand.grid(span = seq(0.15, 0.65, len = 10), degree = 1)
+
+train_loess <- train(Price ~ ., method = "gamLoess", tuneGrid = grid, data = train_set)
+
+predicted_price_loess <- predict(train_loess, test_set, type = "raw")
+
+loess_rmse <- RMSE(test_set$Price, predicted_price_loess)
+
+loess_rmse
+
+```
+
+The rmse score is further down to 56600.13 with Loess model.
+
+2.6) Use decision tree model to predict price
+
+```{r}
+library(rpart)
+
+train_dt <- train(Price ~ ., method = "rpart", tuneGrid = data.frame(cp = seq(0.1, 1, len = 25)), data = train_set)
+
+predicted_price_dt <- predict(train_dt, test_set, type = "raw")
+
+dt_rmse <- RMSE(test_set$Price, predicted_price_dt)
+
+dt_rmse
+```
+
+rmse score with decision tree model is 56556.19, very close to Loess model (56600.13), lower than knn models.
+
+2.7) predict prices with random forest model
+
+```{r}
+library(randomForest)
+
+set.seed(1)
+
+train_rf <- randomForest(Price ~ ., data = train_set)
+
+predicted_price_rf <- predict(train_rf, test_set)
+
+rf_rmse <- RMSE(test_set$Price, predicted_price_rf)
+
+rf_rmse
+```
+
+The rmse score with random forest model is 56679.02, close to score of Loess model (56600.13) and decision tress model(56556.19), but this code Chunk can be run in seconds., the fastest model.
+
+2.8) use cross validation to choose parameter to optimize random forest model.
+
+```{r}
+set.seed(1)
+
+train_rf_2 <- train(Price ~ ., method = "Rborist", tuneGrid = data.frame(predFixed = 2, minNode = c(3, 50)), data = train_set)
+
+predicted_price_rf_2 <- predict(train_rf_2, test_set)
+
+rf_rmse_2 <- RMSE(test_set$Price, predicted_price_rf_2)
+
+rf_rmse_2
+```
+
+We get the score of 56685.96 with random forest cross validation model.
+
+3) Result:
+
+I tried 8 models (group average, KNN, KNN tunegrid, KNN cross validation, Loess, decision tree, random forest, random forest with tuned parameter) to make prediction, and use rmse score from dataset of test set to compare performance. 
+
+The decision tress model performs best among all models with rmse score of 56556, Loess is the 2nd best model with rmse score of 56600..
+
+4) Conclusion
+
+The original data set is a spreadsheet with 16 columns and 50000 rows, I used portion of it to train a model to predict prices of mobile with features of brand, RAM and ROM, so use total 3 features to predict price. RMSE from dataset of test set is the measurement for evaluating performance of models, I run 8 algorithms, it turned out the a decision tree algorithm produce best score, and Loess model perform 2nd best, a confusing issue is that the tune parameter at random forest model that generate best rmse score at train_set dataset may not generate best rmse score at test_set dataset.
+
+5) reference
+
+EDX HarvardX PH125 Data Science
+
+
+
+
